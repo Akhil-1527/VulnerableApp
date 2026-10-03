@@ -61,6 +61,8 @@ Notes
 - type is the first vulnerability_class of the rule, passed through as-is.
   Like the ZAP converter, the script does not hard-code a mapping to
   VulnerableApp's type names; CWE matching is the main axis.
+- Findings must have a CWE or vulnerability_class; otherwise conversion fails
+  before writing output, because the SAST matcher cannot score them.
 - Duplicate (filePath, line, cwe, type) tuples are de-duplicated.
 """
 
@@ -105,6 +107,12 @@ def convert(semgrep_report: dict) -> dict:
         metadata = result.get("extra", {}).get("metadata", {})
         cwe = _cwe_tag(metadata.get("cwe"))
         vuln_type = _first(metadata.get("vulnerability_class"))
+        if not cwe and not vuln_type:
+            rule = result.get("check_id") or "unknown rule"
+            raise ValueError(
+                f"Rule {rule} at {path}:{line} has no CWE or vulnerability_class; "
+                "the SAST matcher would discard this finding."
+            )
 
         key = (path, line, cwe, vuln_type)
         if key in seen:
@@ -152,7 +160,11 @@ def main() -> None:
     with input_path.open(encoding="utf-8") as fh:
         semgrep_report = json.load(fh)
 
-    benchmark_input = convert(semgrep_report)
+    try:
+        benchmark_input = convert(semgrep_report)
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fh:
