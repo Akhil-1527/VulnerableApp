@@ -73,7 +73,15 @@ Semgrep is benchmarked in SAST mode against the VulnerableApp source tree.
 |---|---|---|
 | `p/default` | 1.178.0 | [`benchmarks/Semgrep/semgrep-results.json`](Semgrep/semgrep-results.json) |
 
-Results are updated by hand. Rerun the steps below after the ground truth or a
+The `Semgrep Benchmark` GitHub Actions workflow runs weekly on Sundays at
+00:00 UTC, on relevant pull requests, and manually through `workflow_dispatch`.
+It scans the checkout and builds the application from that same checkout, so
+its packaged ground truth corresponds to the scanned sources. Each run uploads
+the raw report, converted findings, benchmark results, and application log as
+artifacts retained for 30 days. The workflow uses read-only repository access;
+it does not commit results. The checked-in result above remains a sample.
+
+Rerun the steps below to update that sample after the ground truth or a
 vulnerable class changes.
 
 ### Running the benchmark
@@ -111,7 +119,11 @@ python3 benchmarks/Semgrep/scripts/convert_semgrep_to_benchmark.py \
 
 The script emits one finding per Semgrep result: the path, the start line, the
 first CWE ID of the rule, and the rule's `vulnerability_class` as the type. No
-manual rule mapping is needed.
+manual rule mapping is needed. Findings must carry at least one usable CWE or
+`vulnerability_class`. Conversion fails with the rule and source location if
+both are missing, rather than letting the SAST matcher silently discard the
+finding. In that case, add taxonomy metadata to the rule and rerun the scan;
+the converter leaves any existing output file untouched.
 
 ---
 
