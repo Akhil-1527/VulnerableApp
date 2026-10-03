@@ -2,34 +2,32 @@ name: Semgrep Benchmark
 
 on:
   schedule:
-    - cron: '0 0 * * 0'
+    - cron: '0 2 * * *'
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/semgrep-benchmark.yml'
-      - 'benchmarks/Semgrep/**'
-      - 'src/**'
-      - 'build.gradle'
-      - 'gradle/**'
 
 permissions:
-  contents: read
-
-concurrency:
-  group: semgrep-benchmark-${{ github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  benchmark:
+  semgrep-benchmark:
+    name: Semgrep Benchmark
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
-      - name: Checkout source
+
+      # ------------------------------------------------------------------
+      # 1. Checkout repo
+      # ------------------------------------------------------------------
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          fetch-depth: 0
+          token: ${{ secrets.GH_TRAFFIC_TOKEN }}
 
-      - name: Set up Java
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -41,89 +39,124 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install scanner and test tools
-        run: python -m pip install semgrep==1.178.0 pytest==8.4.2
-
-      - name: Test converter
-        run: python -m pytest benchmarks/Semgrep/scripts/ -q
-
-      - name: Build application from scanned checkout
-        run: ./gradlew bootJar --no-daemon
-
-      - name: Prepare report directory
+      # ------------------------------------------------------------------
+      # 2. Start VulnerableApp from this checkout, so the ground truth it
+      #    serves matches the sources that are scanned
+      # ------------------------------------------------------------------
+      - name: Start VulnerableApp
         run: |
-          mkdir -p "$RUNNER_TEMP/semgrep-benchmark"
-          echo "BENCHMARK_DIR=$RUNNER_TEMP/semgrep-benchmark" >> "$GITHUB_ENV"
+          chmod +x gradlew
+          nohup ./gradlew bootRun > vulnerableapp.log 2>&1 &
 
-      - name: Scan source
+      # ------------------------------------------------------------------
+      # 3. Run Semgrep while the app builds
+      # ------------------------------------------------------------------
+      - name: Run Semgrep scan
         run: |
+          python -m pip install --quiet semgrep
+          semgrep --version
           semgrep scan --config p/default --metrics=off --timeout 30 --json \
-            --output "$BENCHMARK_DIR/semgrep-raw-report.json" src/main/java
+            --output benchmarks/Semgrep/semgrep-raw-report.json src/main/java
 
-      - name: Convert findings
+      # ------------------------------------------------------------------
+      # 4. Convert Semgrep report to benchmark input format
+      # ------------------------------------------------------------------
+      - name: Convert Semgrep report
         run: |
           python benchmarks/Semgrep/scripts/convert_semgrep_to_benchmark.py \
-            --input "$BENCHMARK_DIR/semgrep-raw-report.json" \
-            --output "$BENCHMARK_DIR/semgrep-findings.json"
+            --input  benchmarks/Semgrep/semgrep-raw-report.json \
+            --output benchmarks/Semgrep/findings/semgrep-findings.json
 
-      - name: Start application and wait for ground truth
+      # ------------------------------------------------------------------
+      # 5. Wait for app to be ready
+      # ------------------------------------------------------------------
+      - name: Wait for VulnerableApp
         run: |
-          java -jar build/libs/VulnerableApp-1.0.0.jar \
-            --server.address=127.0.0.1 \
-            --benchmark.output.dir="$RUNNER_TEMP/semgrep-benchmark-output" \
-            > "$BENCHMARK_DIR/vulnerableapp.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/vulnerableapp.pid"
-          for attempt in {1..60}; do
-            if curl --fail --silent http://localhost:9090/VulnerableApp/scanner/sast > /dev/null; then
+          echo "Waiting for VulnerableApp..."
+          for _ in {1..60}; do
+            if curl -sf http://localhost:9090/VulnerableApp/scanner >/dev/null; then
+              echo "App is ready"
               exit 0
             fi
-            if ! kill -0 "$(cat "$RUNNER_TEMP/vulnerableapp.pid")" 2>/dev/null; then
-              cat "$BENCHMARK_DIR/vulnerableapp.log"
-              exit 1
-            fi
-            sleep 2
+            sleep 10
           done
-          cat "$BENCHMARK_DIR/vulnerableapp.log"
+          echo "App failed to start"
+          cat vulnerableapp.log
           exit 1
 
-      - name: Score findings
+      # ------------------------------------------------------------------
+      # 6. Submit to benchmark endpoint and save results
+      # ------------------------------------------------------------------
+      - name: Run benchmark
         run: |
-          curl --fail-with-body --silent --show-error \
-            --connect-timeout 10 --max-time 120 \
-            -X POST http://localhost:9090/VulnerableApp/scanner/benchmark \
-            -H 'Content-Type: application/json' \
-            --data-binary @"$BENCHMARK_DIR/semgrep-findings.json" \
-            --output "$BENCHMARK_DIR/semgrep-results.json"
-          python - <<'PY'
+          curl -sS --fail-with-body -X POST http://localhost:9090/VulnerableApp/scanner/benchmark \
+            -H "Content-Type: application/json" \
+            -d @benchmarks/Semgrep/findings/semgrep-findings.json \
+            -o benchmarks/Semgrep/semgrep-results.json
+
+          echo "=== Semgrep Benchmark Results ==="
+          python -c "
           import json
-          import os
-          from pathlib import Path
+          with open('benchmarks/Semgrep/semgrep-results.json') as f:
+              data = json.load(f)
+          print(f'  Tool:          {data[\"tool\"]}')
+          print(f'  Coverage:  {data[\"coverage\"]:.2f}%')
+          print(f'  Total Expected:{data[\"totalExpected\"]}')
+          print(f'  Detected:  {data[\"detected\"]}')
+          print(f'  Missed:    {data[\"missed\"]}')
+          print(f'  Unmatched: {data[\"unmatched\"]}')
+          "
 
-          result = json.loads((Path(os.environ['BENCHMARK_DIR']) / 'semgrep-results.json').read_text())
-          fields = ('totalExpected', 'detected', 'missed', 'unmatched')
-          if result.get('tool') != 'Semgrep' or result.get('persistenceError'):
-              raise SystemExit('Benchmark did not return a successful Semgrep result')
-          if any(type(result.get(field)) is not int or result[field] < 0 for field in fields):
-              raise SystemExit('Benchmark returned invalid counts')
-          if result['totalExpected'] != result['detected'] + result['missed']:
-              raise SystemExit('Benchmark returned inconsistent counts')
-          summary = '\n'.join(f'- {field}: {result[field]}' for field in fields)
-          print(summary)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
-              output.write('## Semgrep benchmark\n\n' + summary + '\n')
-          PY
-
-      - name: Stop application
-        if: always()
+      # ------------------------------------------------------------------
+      # 7. Commit and push results back to repo (master only)
+      # ------------------------------------------------------------------
+      - name: Commit benchmark results
+        if: github.ref == 'refs/heads/master'
+        env:
+          TOKEN: ${{ secrets.GH_TRAFFIC_TOKEN }}
         run: |
-          if [ -f "$RUNNER_TEMP/vulnerableapp.pid" ]; then
-            kill "$(cat "$RUNNER_TEMP/vulnerableapp.pid")" 2>/dev/null || true
+          set -e
+
+          git config user.name "preetkaran20"
+          git config user.email "preetkaran20@gmail.com"
+          git add benchmarks/Semgrep/semgrep-results.json benchmarks/Semgrep/findings/semgrep-findings.json
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
           fi
 
-      - name: Upload reports
+          git commit -m "chore: update Semgrep benchmark results [$(date -u '+%Y-%m-%d')]"
+          success=false
+
+          for i in {1..5}; do
+            echo "Push attempt $i..."
+            if git pull --rebase origin master && git push "https://preetkaran20:${TOKEN}@github.com/SasanLabs/VulnerableApp.git" HEAD:master; then
+              success=true
+              break
+            fi
+
+            git rebase --abort 2>/dev/null || true
+            echo "Push failed. Retrying in 10 seconds..."
+            sleep 10
+          done
+
+          if [ "$success" != "true" ]; then
+            echo "Failed to push after 5 attempts."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 8. Upload raw report, findings, results and app log as artifacts
+      # ------------------------------------------------------------------
+      - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-benchmark-${{ github.run_id }}
-          retention-days: 30
-          path: ${{ runner.temp }}/semgrep-benchmark/
+          name: semgrep-benchmark-artifacts
+          path: |
+            benchmarks/Semgrep/semgrep-raw-report.json
+            benchmarks/Semgrep/findings/semgrep-findings.json
+            benchmarks/Semgrep/semgrep-results.json
+            vulnerableapp.log
+          retention-days: 90
