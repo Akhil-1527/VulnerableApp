@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '0 2 * * *'
   workflow_dispatch:
+  # test branch on the fork only, to show a run for SasanLabs/VulnerableApp#816
+  push:
+    branches: [semgrep-run-demo]
 
 # The results commit pushes with GH_TRAFFIC_TOKEN, so the job token only needs to read
 permissions:
